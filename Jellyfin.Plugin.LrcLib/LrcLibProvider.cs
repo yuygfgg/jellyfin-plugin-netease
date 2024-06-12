@@ -24,7 +24,7 @@ namespace Jellyfin.Plugin.LrcLib;
 /// </summary>
 public class LrcLibProvider : ILyricProvider
 {
-    private const string BaseUrl = "https://lrclib.net";
+    private const string BaseUrl = "https://music.163.com";
     private const string SyncedSuffix = "synced";
     private const string PlainSuffix = "plain";
     private const string SyncedFormat = "lrc";
@@ -87,21 +87,22 @@ public class LrcLibProvider : ILyricProvider
         {
             var requestUri = new UriBuilder(BaseUrl)
             {
-                Path = $"/api/get/{splitId[0]}"
+                Path = $"/api/song/lyric",
+                Query = $"id={splitId[0]}&lv=-1&tv=-1"
             };
 
-            var response = await _httpClientFactory.CreateClient(NamedClient.Default)
-                .GetFromJsonAsync<LrcLibSearchResponse>(requestUri.Uri, cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
+            var httpClient = _httpClientFactory.CreateClient(NamedClient.Default);
+            httpClient.DefaultRequestHeaders.Referrer = new Uri("https://music.163.com");
+            var response = await httpClient.GetFromJsonAsync<NeteaseLyricResponse>(requestUri.Uri, cancellationToken: cancellationToken).ConfigureAwait(false);
             if (response is null)
             {
                 throw new ResourceNotFoundException("Unable to get results for id {Id}");
             }
 
             if (string.Equals(splitId[1], SyncedSuffix, StringComparison.OrdinalIgnoreCase)
-                && !string.IsNullOrEmpty(response.SyncedLyrics))
+                && !string.IsNullOrEmpty(response.lrc.lyric))
             {
-                var stream = new MemoryStream(Encoding.UTF8.GetBytes(response.SyncedLyrics));
+                var stream = new MemoryStream(Encoding.UTF8.GetBytes(response.lrc.lyric));
                 return new LyricResponse
                 {
                     Format = SyncedFormat,
@@ -110,9 +111,9 @@ public class LrcLibProvider : ILyricProvider
             }
 
             if (string.Equals(splitId[1], PlainSuffix, StringComparison.OrdinalIgnoreCase)
-                && !string.IsNullOrEmpty(response.PlainLyrics))
+                && !string.IsNullOrEmpty(response.tlyric.lyric))
             {
-                var stream = new MemoryStream(Encoding.UTF8.GetBytes(response.PlainLyrics));
+                var stream = new MemoryStream(Encoding.UTF8.GetBytes(response.tlyric.lyric));
                 return new LyricResponse
                 {
                     Format = PlainFormat,
@@ -167,29 +168,27 @@ public class LrcLibProvider : ILyricProvider
         }
 
         var queryStringBuilder = new StringBuilder()
-            .Append("track_name=")
+            .Append("s=")
             .Append(HttpUtility.UrlEncode(request.SongName))
-            .Append("&artist_name=")
-            .Append(HttpUtility.UrlEncode(artist))
-            .Append("&album_name=")
-            .Append(HttpUtility.UrlEncode(request.AlbumName))
-            .Append("&duration=")
-            .Append(TimeSpan.FromTicks(request.Duration.Value).TotalSeconds.ToString(CultureInfo.InvariantCulture));
+            .Append("&type=1")
+            .Append("&limit=50");
         var requestUri = new UriBuilder(BaseUrl)
         {
-            Path = "/api/get",
+            Path = "/api/search/get/web",
             Query = queryStringBuilder.ToString()
         };
 
         var httpClient = _httpClientFactory.CreateClient(NamedClient.Default);
+        httpClient.DefaultRequestHeaders.Referrer = new Uri("https://music.163.com");
 
-        var response = await httpClient.GetFromJsonAsync<LrcLibSearchResponse>(requestUri.Uri, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var response = await httpClient.GetFromJsonAsync<NeteaseSearchResponse>(requestUri.Uri, cancellationToken: cancellationToken).ConfigureAwait(false);
         if (response is null)
         {
             return Enumerable.Empty<RemoteLyricInfo>();
         }
 
-        return GetRemoteLyrics(response);
+        var songs = response.result.songs.Where(song => Math.Abs(song.duration / 1000 - request.Duration.Value.TotalSeconds) <= 3).ToList();
+        return await GetLyricsFromSongs(songs, cancellationToken);
     }
 
     private async Task<IEnumerable<RemoteLyricInfo>> GetFuzzyMatch(
@@ -203,9 +202,10 @@ public class LrcLibProvider : ILyricProvider
         }
 
         var queryStringBuilder = new StringBuilder()
-            .Append("track_name=")
-            .Append(HttpUtility.UrlEncode(request.SongName));
-
+            .Append("s=")
+            .Append(HttpUtility.UrlEncode(request.SongName))
+            .Append("&type=1")
+            .Append("&limit=50");
         if (!ExcludeArtistName)
         {
             string artist;
@@ -240,46 +240,79 @@ public class LrcLibProvider : ILyricProvider
 
         var requestUri = new UriBuilder(BaseUrl)
         {
-            Path = "/api/search",
+            Path = "/api/search/get/web",
             Query = queryStringBuilder.ToString()
         };
 
         var httpClient = _httpClientFactory.CreateClient(NamedClient.Default);
+        httpClient.DefaultRequestHeaders.Referrer = new Uri("https://music.163.com");
 
-        var response = await httpClient.GetFromJsonAsync<IReadOnlyList<LrcLibSearchResponse>>(requestUri.Uri, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var response = await httpClient.GetFromJsonAsync<NeteaseSearchResponse>(requestUri.Uri, cancellationToken: cancellationToken).ConfigureAwait(false);
         if (response is null)
         {
             return Enumerable.Empty<RemoteLyricInfo>();
         }
 
-        var results = new List<RemoteLyricInfo>();
-        foreach (var item in response)
-        {
-            results.AddRange(GetRemoteLyrics(item));
-        }
-
-        var sortedResults = results.OrderByDescending(x => x.Metadata.IsSynced);
-
-        return sortedResults;
+        var songs = response.result.songs.ToList();
+        return await GetLyricsFromSongs(songs, cancellationToken);
     }
 
-    private List<RemoteLyricInfo> GetRemoteLyrics(LrcLibSearchResponse response)
+    private async Task<IEnumerable<RemoteLyricInfo>> GetLyricsFromSongs(IEnumerable<NeteaseSong> songs, CancellationToken cancellationToken)
+    {
+        var results = new List<RemoteLyricInfo>();
+        foreach (var song in songs)
+        {
+            var lyrics_content, trans_lyrics_content = await download_lyrics(song.id, cancellationToken).ConfigureAwait(false);
+
+            if (lyrics_content)
+            {
+                lrc_dict, unformatted_lines = ParseLyrics(lyrics_content);
+                if (lrc_dict.Count >= 5)
+                {
+                    tlyric_dict, _ = ParseLyrics(trans_lyrics_content ?? string.Empty);
+                    var merged = MergeLyrics(lrc_dict, tlyric_dict, unformatted_lines);
+                    results.Add(new RemoteLyricInfo
+                    {
+                        Id = $"{song.id}_{SyncedSuffix}",
+                        ProviderName = Name,
+                        Metadata = new LyricMetadata
+                        {
+                            Album = song.album.name,
+                            Artist = string.Join(", ", song.artists.Select(artist => artist.name)),
+                            Title = song.name,
+                            Length = TimeSpan.FromMilliseconds(song.duration).Ticks,
+                            IsSynced = true
+                        },
+                        Lyrics = new LyricResponse
+                        {
+                            Format = SyncedFormat,
+                            Stream = new MemoryStream(Encoding.UTF8.GetBytes(merged))
+                        }
+                    });
+                }
+            }
+        }
+
+        return results;
+    }
+
+    private List<RemoteLyricInfo> GetRemoteLyrics(NeteaseSong song)
     {
         var results = new List<RemoteLyricInfo>();
 
-        if (!string.IsNullOrEmpty(response.SyncedLyrics))
+        if (!string.IsNullOrEmpty(song.lrc.lyric))
         {
-            var stream = new MemoryStream(Encoding.UTF8.GetBytes(response.SyncedLyrics));
+            var stream = new MemoryStream(Encoding.UTF8.GetBytes(song.lrc.lyric));
             results.Add(new RemoteLyricInfo
             {
-                Id = $"{response.Id}_{SyncedSuffix}",
+                Id = $"{song.id}_{SyncedSuffix}",
                 ProviderName = Name,
                 Metadata = new LyricMetadata
                 {
-                    Album = response.AlbumName,
-                    Artist = response.ArtistName,
-                    Title = response.TrackName,
-                    Length = TimeSpan.FromSeconds(response.Duration ?? 0).Ticks,
+                    Album = song.album.name,
+                    Artist = string.Join(", ", song.artists.Select(artist => artist.name)),
+                    Title = song.name,
+                    Length = TimeSpan.FromMilliseconds(song.duration).Ticks,
                     IsSynced = true
                 },
                 Lyrics = new LyricResponse
@@ -290,19 +323,19 @@ public class LrcLibProvider : ILyricProvider
             });
         }
 
-        if (!string.IsNullOrEmpty(response.PlainLyrics))
+        if (!string.IsNullOrEmpty(song.tlyric.lyric))
         {
-            var stream = new MemoryStream(Encoding.UTF8.GetBytes(response.PlainLyrics));
+            var stream = new MemoryStream(Encoding.UTF8.GetBytes(song.tlyric.lyric));
             results.Add(new RemoteLyricInfo
             {
-                Id = $"{response.Id}_{PlainSuffix}",
+                Id = $"{song.id}_{PlainSuffix}",
                 ProviderName = Name,
                 Metadata = new LyricMetadata
                 {
-                    Album = response.AlbumName,
-                    Artist = response.ArtistName,
-                    Title = response.TrackName,
-                    Length = TimeSpan.FromSeconds(response.Duration ?? 0).Ticks,
+                    Album = song.album.name,
+                    Artist = string.Join(", ", song.artists.Select(artist => artist.name)),
+                    Title = song.name,
+                    Length = TimeSpan.FromMilliseconds(song.duration).Ticks,
                     IsSynced = false
                 },
                 Lyrics = new LyricResponse
@@ -314,5 +347,51 @@ public class LrcLibProvider : ILyricProvider
         }
 
         return results;
+    }
+
+    private Dictionary<string, string> ParseLyrics(string lyrics)
+    {
+        var lyricsDict = new Dictionary<string, string>();
+        var pattern = new Regex(@"\[(\d{2}):(\d{2})([.:]\d{2,3})?\](.*)");
+
+        foreach (var line in lyrics.Split('\n'))
+        {
+            var match = pattern.Match(line);
+            if (match.Success)
+            {
+                var minute = match.Groups[1].Value;
+                var second = match.Groups[2].Value;
+                var millisecond = match.Groups[3].Value ?? ".000";
+                millisecond = millisecond.Replace(":", ".");
+                var lyric = match.Groups[4].Value;
+                var timeStamp = $"[{minute}:{second}{millisecond}]";
+                lyricsDict[timeStamp] = lyric;
+            }
+        }
+
+        return lyricsDict;
+    }
+
+    private string MergeLyrics(Dictionary<string, string> lrcDict, Dictionary<string, string> tlyricDict, List<string> unformattedLines)
+    {
+        var mergedLyrics = new StringBuilder();
+        foreach (var line in unformattedLines)
+        {
+            mergedLyrics.AppendLine(line);
+        }
+
+        var allTimeStamps = lrcDict.Keys.Union(tlyricDict.Keys).OrderBy(t => t);
+        foreach (var timeStamp in allTimeStamps)
+        {
+            var originalLine = lrcDict.ContainsKey(timeStamp) ? lrcDict[timeStamp] : string.Empty;
+            var translatedLine = tlyricDict.ContainsKey(timeStamp) ? tlyricDict[timeStamp] : string.Empty;
+            mergedLyrics.AppendLine($"{timeStamp}{originalLine}");
+            if (!string.IsNullOrEmpty(translatedLine))
+            {
+                mergedLyrics.AppendLine($"{timeStamp}{translatedLine}");
+            }
+        }
+
+        return mergedLyrics.ToString();
     }
 }
